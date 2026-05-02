@@ -1,44 +1,16 @@
-# -*- coding: utf-8 -*-
-"""
-制式文档生成API服务
-使用FastAPI + python-docx实现Word模板替换功能
-"""
-
-import os
-import re
-import uuid
-import json
-import base64
-from typing import List, Optional, Union
-from urllib.parse import urlparse
-from datetime import datetime, timedelta
-
-import requests
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from docx import Document
-from docx.text.paragraph import Paragraph
-from docx.table import Table
-from docx.oxml.text.paragraph import CT_P
-from docx.oxml.table import CT_Tc
-from docx.oxml.shared import qn
+import requests
+import io
+import uuid
+import tempfile
+import os
 
-# 配置
-HOST = os.environ.get("HOST", "0.0.0.0")
-PORT = int(os.environ.get("PORT", "8000"))
-BASE_URL = os.environ.get("BASE_URL", f"http://localhost:{PORT}")
+app = FastAPI()
 
-# 内存文件存储（防止磁盘文件丢失）
-file_store = {}
-
-app = FastAPI(
-    title="制式文档生成API",
-    description="Word模板占位符替换服务",
-    version="1.2.0"
-)
-
+# 配置CORS，允许跨域请求
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -47,226 +19,116 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 全局内存存储（Render免费版重启会清空）
+file_store = {}
 
-class GenerateRequest(BaseModel):
-    template_file_url: str
-    text_keys: Union[List[str], str]
-    text_values: Union[List[str], str]
-    filename: Optional[str] = None
-
-
-def parse_json_param(param):
-    if param is None:
-        return []
-    if isinstance(param, list):
-        return [str(item) for item in param]
-    if isinstance(param, str):
-        try:
-            parsed = json.loads(param)
-            if isinstance(parsed, list):
-                return [str(item) for item in parsed]
-            return [str(parsed)]
-        except json.JSONDecodeError:
-            return [param]
-    return [str(param)]
-
-
-def download_file(url: str) -> bytes:
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, headers=headers, timeout=60)
-        response.raise_for_status()
-        return response.content
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=400, detail=f"下载模板文件失败: {str(e)}")
-
-
-def merge_runs_in_paragraph(paragraph):
-    if not paragraph.runs:
-        return {"text": "", "runs": [], "formatting": None}
-    full_text = ""
-    for run in paragraph.runs:
-        full_text += run.text if run.text else ""
-    first_run = paragraph.runs[0]
-    formatting = {
-        "bold": first_run.bold,
-        "italic": first_run.italic,
-        "underline": first_run.underline,
-        "font.name": first_run.font.name,
-        "font.size": first_run.font.size,
-        "font.color.rgb": first_run.font.color.rgb if first_run.font.color and first_run.font.color.rgb else None,
-    }
-    return {"text": full_text, "runs": list(paragraph.runs), "formatting": formatting}
-
-
-def replace_placeholders_in_text(text, keys, values):
-    result = text
-    for key, value in zip(keys, values):
-        pattern = r'\{\{\s*' + re.escape(key) + r'\s*\}\}'
-        result = re.sub(pattern, str(value), result)
-    return result
-
-
-def apply_formatting_to_run(run, formatting):
-    if formatting is None:
-        return
-    if formatting.get("bold") is not None:
-        run.bold = formatting["bold"]
-    if formatting.get("italic") is not None:
-        run.italic = formatting["italic"]
-    if formatting.get("underline") is not None:
-        run.underline = formatting["underline"]
-    if formatting.get("font.name"):
-        run.font.name = formatting["font.name"]
-    if formatting.get("font.size"):
-        run.font.size = formatting["font.size"]
-    if formatting.get("font.color.rgb"):
-        from docx.shared import RGBColor
-        run.font.color.rgb = formatting["font.color.rgb"]
-
-
-def process_paragraph(paragraph, keys, values):
-    if not paragraph.runs:
-        return
-    para_info = merge_runs_in_paragraph(paragraph)
-    original_text = para_info["text"]
-    if not original_text:
-        return
-    has_placeholder = False
-    for key in keys:
-        if re.search(r'\{\{\s*' + re.escape(key) + r'\s*\}\}', original_text):
-            has_placeholder = True
-            break
-    if not has_placeholder:
-        return
-    new_text = replace_placeholders_in_text(original_text, keys, values)
-    if new_text == original_text:
-        return
-    if paragraph.runs:
-        first_run = paragraph.runs[0]
-        first_run.text = new_text
-        for run in paragraph.runs[1:]:
-            run.text = ""
-        apply_formatting_to_run(first_run, para_info["formatting"])
-
-
-def process_table(table, keys, values):
-    for row in table.rows:
-        for cell in row.cells:
-            for paragraph in cell.paragraphs:
-                process_paragraph(paragraph, keys, values)
-
-
-def process_document(doc, keys, values):
-    for element in doc.element.body:
-        if isinstance(element, CT_P):
-            paragraph = Paragraph(element, doc)
-            process_paragraph(paragraph, keys, values)
-    for table in doc.tables:
-        process_table(table, keys, values)
-
-
-def generate_filename(original_url, custom_filename=None):
-    if custom_filename:
-        if not custom_filename.lower().endswith('.docx'):
-            custom_filename += '.docx'
-        return custom_filename
-    parsed = urlparse(original_url)
-    basename = os.path.basename(parsed.path)
-    if basename and basename.lower().endswith('.docx'):
-        unique_id = uuid.uuid4().hex[:8]
-        name, ext = os.path.splitext(basename)
-        return f"{name}_{unique_id}{ext}"
-    return f"generated_{uuid.uuid4().hex[:8]}.docx"
-
-
-@app.get("/")
-async def root():
-    return {"service": "制式文档生成API", "version": "1.2.0", "status": "running"}
-
-
+# 健康检查接口
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
 
-
+# 文档生成接口
 @app.post("/generate")
-async def generate_document(request: GenerateRequest):
+async def generate_document(data: dict):
     try:
-        keys = parse_json_param(request.text_keys)
-        values = parse_json_param(request.text_values)
-
-        if len(keys) != len(values):
-            raise HTTPException(status_code=400, detail=f"text_keys数量({len(keys)})与text_values数量({len(values)})不匹配")
-        if not keys:
-            raise HTTPException(status_code=400, detail="text_keys不能为空")
-
-        file_content = download_file(request.template_file_url)
-
-        import tempfile
-        temp_input = tempfile.NamedTemporaryFile(delete=False, suffix='.docx')
-        temp_input.write(file_content)
-        temp_input.close()
-
+        # 接收参数
+        text_keys = data.get("text_keys", [])
+        text_values = data.get("text_values", [])
+        template_file_url = data.get("template_file_url", "")
+        
+        if not template_file_url:
+            raise HTTPException(status_code=400, detail="template_file_url不能为空")
+        
+        if len(text_keys) != len(text_values):
+            raise HTTPException(status_code=400, detail=f"text_keys数量({len(text_keys)})与text_values数量({len(text_values)})不匹配")
+        
+        # 1. 下载模板文件
         try:
-            doc = Document(temp_input.name)
-            process_document(doc, keys, values)
-
-            output_filename = generate_filename(request.template_file_url, request.filename)
-
-            import io
-            buffer = io.BytesIO()
-            doc.save(buffer)
-            file_bytes = buffer.getvalue()
-
-            # 存到内存，2小时内可下载
-            file_store[output_filename] = {
-                "data": file_bytes,
-                "expires": datetime.now() + timedelta(hours=2)
-            }
-
-            download_url = f"{BASE_URL}/download/{output_filename}"
-
-            return JSONResponse({
-                "success": True,
-                "message": "文档生成成功",
-                "full_download_url": download_url,
-                "filename": output_filename,
-                "replaced_count": len(keys)
-            })
-        finally:
-            os.unlink(temp_input.name)
-
-    except HTTPException:
-        raise
+            template_response = requests.get(template_file_url, timeout=30)
+            template_response.raise_for_status()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"模板文件下载失败: {str(e)}")
+        
+        # 2. 打开Word模板
+        try:
+            template_stream = io.BytesIO(template_response.content)
+            doc = Document(template_stream)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"模板文件打开失败: {str(e)}")
+        
+        # 3. 替换普通段落中的占位符（保留原有格式）
+        for paragraph in doc.paragraphs:
+            for key, value in zip(text_keys, text_values):
+                placeholder = f"{{{{{key}}}}}"
+                if placeholder in paragraph.text:
+                    # 遍历每个run，只替换占位符内容，保留原有格式（字体、下划线、颜色等）
+                    for run in paragraph.runs:
+                        if placeholder in run.text:
+                            run.text = run.text.replace(placeholder, str(value))
+        
+        # 4. 替换表格中的占位符（保留表格内的格式，很多用户模板里有表格）
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for paragraph in cell.paragraphs:
+                        for key, value in zip(text_keys, text_values):
+                            placeholder = f"{{{{{key}}}}}"
+                            if placeholder in paragraph.text:
+                                # 同样保留表格内的原有格式
+                                for run in paragraph.runs:
+                                    if placeholder in run.text:
+                                        run.text = run.text.replace(placeholder, str(value))
+        
+        # 5. 保存生成的文档到内存
+        output_stream = io.BytesIO()
+        doc.save(output_stream)
+        output_stream.seek(0)
+        
+        # 6. 生成唯一文件名（避免中文编码问题）
+        file_id = str(uuid.uuid4())[:8]
+        filename = f"立项文档_{file_id}.docx"
+        
+        # 7. 存储到内存
+        file_store[file_id] = {
+            "content": output_stream.getvalue(),
+            "filename": filename
+        }
+        
+        # 8. 返回下载链接
+        base_url = str(requests.get('https://api.ipify.org').text)  # 自动获取当前服务域名
+        download_url = f"https://docx-generator-2eox.onrender.com/download/{file_id}"
+        
+        return {
+            "success": True,
+            "full_download_url": download_url,
+            "filename": filename,
+            "replaced_count": len(text_keys)
+        }
+    
+    except HTTPException as e:
+        raise e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"生成文档失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"内部错误: {str(e)}")
 
-
-@app.get("/download/{filename}")
-async def download_file_endpoint(filename: str):
-    filename = os.path.basename(filename)
-
-    if filename in file_store:
-        item = file_store[filename]
-        if datetime.now() < item["expires"]:
-            from fastapi.responses import Response
-            return Response(
-                content=item["data"],
-                media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                headers={"Content-Disposition": f"attachment; filename={filename}"}
-            )
-        else:
-            del file_store[filename]
-            raise HTTPException(status_code=404, detail="文件已过期")
-
-    raise HTTPException(status_code=404, detail="文件不存在")
-
-
-def start_server():
-    import uvicorn
-    uvicorn.run(app, host=HOST, port=PORT)
-
+# 文件下载接口
+@app.get("/download/{file_id}")
+async def download_file(file_id: str):
+    if file_id not in file_store:
+        raise HTTPException(status_code=404, detail="文件不存在或已过期")
+    
+    file_data = file_store[file_id]
+    
+    # 生成临时文件返回
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
+        tmp.write(file_data["content"])
+        tmp_path = tmp.name
+    
+    return FileResponse(
+        tmp_path,
+        filename=file_data["filename"],
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
 
 if __name__ == "__main__":
-    start_server()
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
