@@ -34,10 +34,10 @@ file_store = {}
 app = FastAPI(
     title="制式文档生成API",
     description="Word模板占位符替换服务",
-    version="1.2.0-red-table-fix"
+    version="2.0.0-md-table-generic"
 )
 
-# 全局异常捕获（方便看错误）
+# 全局异常捕获
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     print("❌ 全局错误：", exc)
@@ -186,59 +186,89 @@ def set_cell_text(cell, text, bold=False, font_size=10.5, align=WD_ALIGN_PARAGRA
     run._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
 
 
-# ======================= 自动解析 | 分隔文本 → 表格 =======================
-def parse_pipe_table(text):
-    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
-    table_data = []
-    for line in lines:
-        row = [cell.strip() for cell in line.split('|')]
-        table_data.append(row)
-    return table_data
+# ======================= 🆕 通用 Markdown 表格解析引擎 =======================
+def is_markdown_table(text):
+    """判断字符串是否符合标准 Markdown 表格特征"""
+    if not isinstance(text, str) or '|' not in text:
+        return False
+    lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+    if len(lines) < 3:
+        return False
+    # 验证第二行是否为分隔行（仅允许 | - : 空格）
+    sep_line = lines[1]
+    if '|' not in sep_line:
+        return False
+    return all(c in '|-: ' for c in sep_line)
 
 
-def is_pipe_table(text):
-    return '|' in text.strip() and len(text.strip().splitlines()) > 1
+def parse_markdown_table(text):
+    """解析 Markdown 表格，返回 (表头列表, 对齐方式列表, 数据行列表)"""
+    lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+    
+    def split_row(line):
+        # 去除首尾多余的 | 后分割
+        return [cell.strip() for cell in line.strip().strip('|').split('|')]
+
+    headers = split_row(lines[0])
+    sep_parts = split_row(lines[1])
+    
+    # 解析对齐方式
+    alignments = []
+    for part in sep_parts:
+        part = part.strip()
+        if part.startswith(':') and part.endswith(':'):
+            alignments.append(WD_ALIGN_PARAGRAPH.CENTER)
+        elif part.endswith(':'):
+            alignments.append(WD_ALIGN_PARAGRAPH.RIGHT)
+        else:
+            alignments.append(WD_ALIGN_PARAGRAPH.LEFT)
+            
+    data_rows = [split_row(line) for line in lines[2:]]
+    return headers, alignments, data_rows
 
 
-def replace_placeholder_with_auto_table(doc, placeholder, table_text):
+def replace_placeholder_with_markdown_table(doc, placeholder, md_text):
+    """查找占位符段落，替换为 Markdown 渲染的 Word 表格"""
     target_para = None
-    body = doc.element.body
-    for element in body:
+    for element in doc.element.body:
         if isinstance(element, CT_P):
             para = Paragraph(element, doc)
-            full_text = "".join(run.text for run in para.runs)
-            if placeholder in full_text:
+            if placeholder in "".join(run.text for run in para.runs):
                 target_para = para
                 break
     if target_para is None:
         return False
 
-    table_data = parse_pipe_table(table_text)
-    if not table_data:
+    headers, alignments, data_rows = parse_markdown_table(md_text)
+    if not headers or not data_rows:
         return False
 
-    rows = len(table_data)
-    cols = max(len(row) for row in table_data)
-    table = doc.add_table(rows=rows, cols=cols)
+    num_cols = len(headers)
+    table = doc.add_table(rows=len(data_rows) + 1, cols=num_cols)
     table.style = 'Table Grid'
 
-    for r_idx, row in enumerate(table_data):
-        for c_idx, cell_text in enumerate(row):
-            if c_idx >= len(table.rows[r_idx].cells):
-                continue
+    # 1. 填充表头
+    for c_idx, header_text in enumerate(headers):
+        cell = table.cell(0, c_idx)
+        set_cell_border(cell)
+        set_cell_background(cell, 'E6E6E6')
+        align = alignments[c_idx] if c_idx < len(alignments) else WD_ALIGN_PARAGRAPH.LEFT
+        set_cell_text(cell, header_text, bold=True, align=align)
+
+    # 2. 填充数据行（自动补齐/截断，防止越界）
+    for r_idx, row_data in enumerate(data_rows, start=1):
+        row_data = (row_data + [''] * num_cols)[:num_cols]
+        for c_idx, cell_text in enumerate(row_data):
             cell = table.cell(r_idx, c_idx)
             set_cell_border(cell)
-            if r_idx == 0:
-                set_cell_background(cell, 'E6E6E6')
-                set_cell_text(cell, cell_text, bold=True)
-            else:
-                if r_idx % 2 == 1:
-                    set_cell_background(cell, 'F5F5F5')
-                set_cell_text(cell, cell_text, bold=False)
+            if r_idx % 2 == 0:  # 斑马纹
+                set_cell_background(cell, 'F5F5F5')
+            align = alignments[c_idx] if c_idx < len(alignments) else WD_ALIGN_PARAGRAPH.LEFT
+            set_cell_text(cell, cell_text, bold=False, align=align)
 
+    # 3. 插入表格并移除原占位符
     target_para._element.addprevious(table._tbl)
-    parent = target_para._element.getparent()
-    parent.remove(target_para._element)
+    target_para._element.getparent().remove(target_para._element)
     return True
 # ================================================================================
 
@@ -385,43 +415,37 @@ def process_table(table, keys, values):
 
 
 def process_document(doc, keys, values):
-    # 自动表格
-    auto_table_key = "性能指标表格"
-    auto_table_idx = None
-    for i, key in enumerate(keys):
-        if key == auto_table_key:
-            auto_table_idx = i
-            break
-    if auto_table_idx is not None:
-        table_text = values[auto_table_idx]
-        if is_pipe_table(table_text):
-            replace_placeholder_with_auto_table(doc, f"{{{{{auto_table_key}}}}}", table_text)
-            keys = [k for i, k in enumerate(keys) if i != auto_table_idx]
-            values = [v for i, v in enumerate(values) if i != auto_table_idx]
-    # 研发内容表格
+    processed_indices = set()
+
+    # 1. 🆕 通用 Markdown 表格自动识别（任意 Key 均可触发）
+    for i, (k, v) in enumerate(zip(keys, values)):
+        if is_markdown_table(v):
+            placeholder = f"{{{{{k}}}}}"
+            if replace_placeholder_with_markdown_table(doc, placeholder, v):
+                processed_indices.add(i)
+
+    # 2. 兼容旧版 JSON 表格逻辑（研发内容完成情况）
     table_placeholder = '研发内容完成情况'
-    table_data_key_idx = None
-    for i, key in enumerate(keys):
-        if key == table_placeholder:
-            table_data_key_idx = i
-            break
-    if table_data_key_idx is not None:
+    table_data_key_idx = next((i for i, k in enumerate(keys) if k == table_placeholder), None)
+    if table_data_key_idx is not None and table_data_key_idx not in processed_indices:
         raw_value = values[table_data_key_idx]
         try:
             table_data = json.loads(raw_value)
+            if isinstance(table_data, list):
+                replace_placeholder_with_table(doc, f'{{{{{table_placeholder}}}}}', table_data)
+                processed_indices.add(table_data_key_idx)
         except Exception:
-            table_data = None
-        if table_data:
-            replace_placeholder_with_table(doc, f'{{{{{table_placeholder}}}}}', table_data)
-            keys = [k for i, k in enumerate(keys) if i != table_data_key_idx]
-            values = [v for i, v in enumerate(values) if i != table_data_key_idx]
-    # 普通文本
+            pass
+
+    # 3. 过滤已处理的 Key/Value，执行剩余文本替换
+    new_keys = [k for i, k in enumerate(keys) if i not in processed_indices]
+    new_values = [v for i, v in enumerate(values) if i not in processed_indices]
+
     for element in doc.element.body:
         if isinstance(element, CT_P):
-            paragraph = Paragraph(element, doc)
-            process_paragraph(paragraph, keys, values)
+            process_paragraph(Paragraph(element, doc), new_keys, new_values)
     for table in doc.tables:
-        process_table(table, keys, values)
+        process_table(table, new_keys, new_values)
 
 
 def generate_filename(original_url, custom_filename=None):
@@ -440,7 +464,7 @@ def generate_filename(original_url, custom_filename=None):
 
 @app.get("/")
 async def root():
-    return {"service": "制式文档生成API", "version": "1.2.0-red-table-fix", "status": "running"}
+    return {"service": "制式文档生成API", "version": "2.0.0-md-table-generic", "status": "running"}
 
 
 @app.get("/health")
@@ -490,7 +514,7 @@ async def generate_document(request: GenerateRequest):
 
             return JSONResponse({
                 "success": True,
-                "message": "文档生成成功2",
+                "message": "文档生成成功1",
                 "full_download_url": download_url,
                 "filename": output_filename,
                 "replaced_count": len(keys)
