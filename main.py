@@ -490,7 +490,7 @@ async def generate_document(request: GenerateRequest):
 
             return JSONResponse({
                 "success": True,
-                "message": "文档生成成功",
+                "message": "文档生成成功2",
                 "full_download_url": download_url,
                 "filename": output_filename,
                 "replaced_count": len(keys)
